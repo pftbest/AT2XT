@@ -9,9 +9,8 @@ use bit_reverse::BitwiseReverse;
 
 extern crate msp430g2211;
 
-#[macro_use(task)]
 extern crate msp430_rtfm as rtfm;
-use rtfm::app;
+use rtfm::{app, Resource, Threshold};
 
 extern crate msp430_atomic;
 use msp430_atomic::AtomicBool;
@@ -64,6 +63,7 @@ app! {
 
     tasks: {
         PORT1: {
+            path: porta_handler,
             resources: [KEYBOARD_PINS, PORT_1_2, IN_BUFFER, KEY_IN, KEY_OUT],
         },
     },
@@ -86,10 +86,12 @@ app! {
 
     tasks: {
         PORT1: {
+            path: porta_handler,
             resources: [KEYBOARD_PINS, PORT_1_2, IN_BUFFER, KEY_IN, KEY_OUT],
         },
 
         TIMERA0: {
+            path: timer0_handler,
             resources: [TIMER_A2],
         }
     },
@@ -97,9 +99,7 @@ app! {
 
 
 #[cfg(feature = "use-timer")]
-task!(TIMERA0, timer0_handler);
-#[cfg(feature = "use-timer")]
-fn timer0_handler(mut r: TIMERA0::Resources) {
+fn timer0_handler(_t: &mut Threshold, mut r: TIMERA0::Resources) {
     let timer = r.TIMER_A2;
     TIMEOUT.store(true);
 
@@ -111,8 +111,7 @@ fn timer0_handler(mut r: TIMERA0::Resources) {
 }
 
 
-task!(PORT1, porta_handler);
-fn porta_handler(mut r: PORT1::Resources) {
+fn porta_handler(_t: &mut Threshold, mut r: PORT1::Resources) {
     if HOST_MODE.load() {
         if !r.KEY_OUT.is_empty() {
             if r.KEY_OUT.shift_out() {
@@ -178,8 +177,8 @@ fn init(p: init::Peripherals, r: init::Resources) {
     }
 }
 
-fn idle(mut r: idle::Resources) -> ! {
-    send_byte_to_at_keyboard(&mut r, 0xFF);
+fn idle(t: &mut Threshold, mut r: idle::Resources) -> ! {
+    send_byte_to_at_keyboard(t, &mut r, 0xFF);
 
     let mut loop_cmd : Cmd;
     let mut loop_reply : ProcReply = ProcReply::init();
@@ -191,17 +190,17 @@ fn idle(mut r: idle::Resources) -> ! {
 
         loop_reply = match loop_cmd {
             Cmd::ClearBuffer => {
-                rtfm::atomic(|cs| {
+                rtfm::atomic(t, |cs| {
                     r.IN_BUFFER.borrow_mut(cs).flush();
                 });
                 ProcReply::ClearedBuffer
             },
             Cmd::ToggleLed(m) => {
-                toggle_leds(&mut r, m);
+                toggle_leds(t, &mut r, m);
                 ProcReply::LedToggled(m)
             }
             Cmd::SendXTKey(k) => {
-                send_byte_to_pc(&mut r, k);
+                send_byte_to_pc(t, &mut r, k);
                 ProcReply::SentKey(k)
             },
             Cmd::WaitForKey => {
@@ -209,14 +208,14 @@ fn idle(mut r: idle::Resources) -> ! {
                 // the keyboard to send data to the micro at the same time. To keep control flow simple,
                 // the micro will only respond to host PC acknowledge requests if its idle.
                 let mut xt_reset : bool = false;
-                'idle: while rtfm::atomic(|cs| { r.IN_BUFFER.borrow(cs).is_empty() }) {
+                'idle: while rtfm::atomic(t, |cs| { r.IN_BUFFER.borrow(cs).is_empty() }) {
                     // If host computer wants to reset
-                    if rtfm::atomic(|cs| {
+                    if rtfm::atomic(t, |cs| {
                         r.KEYBOARD_PINS.borrow(cs)
                             .xt_sense.is_unset(r.PORT_1_2.borrow(cs))
                     }) {
-                        send_byte_to_at_keyboard(&mut r, 0xFF);
-                        send_byte_to_pc(&mut r, 0xAA);
+                        send_byte_to_at_keyboard(t, &mut r, 0xFF);
+                        send_byte_to_pc(t, &mut r, 0xAA);
                         xt_reset = true;
                         break;
                     }
@@ -225,7 +224,7 @@ fn idle(mut r: idle::Resources) -> ! {
                 if xt_reset {
                     ProcReply::KeyboardReset
                 } else {
-                    let mut bits_in = rtfm::atomic(|cs|{
+                    let mut bits_in = rtfm::atomic(t, |cs|{
                         r.IN_BUFFER.borrow_mut(cs).take().unwrap()
                     });
 
@@ -239,8 +238,8 @@ fn idle(mut r: idle::Resources) -> ! {
     }
 }
 
-pub fn send_xt_bit(r: &mut idle::Resources, bit : u8) -> () {
-    rtfm::atomic(|cs| {
+pub fn send_xt_bit(t: &mut Threshold, r: &mut idle::Resources, bit : u8) -> () {
+    rtfm::atomic(t, |cs| {
         let pins = r.KEYBOARD_PINS.borrow(cs);
         let port = r.PORT_1_2.borrow(cs);
         if bit == 1 {
@@ -252,44 +251,44 @@ pub fn send_xt_bit(r: &mut idle::Resources, bit : u8) -> () {
         pins.xt_clk.unset(port);
     });
 
-    delay(r, us_to_ticks!(55));
+    delay(t, r, us_to_ticks!(55));
 
-    rtfm::atomic(|cs| {
+    rtfm::atomic(t, |cs| {
         r.KEYBOARD_PINS.borrow(cs)
             .xt_clk.set(r.PORT_1_2.borrow(cs));
     });
 }
 
-pub fn send_byte_to_pc(r: &mut idle::Resources, mut byte : u8) -> () {
+pub fn send_byte_to_pc(t: &mut Threshold, r: &mut idle::Resources, mut byte : u8) -> () {
     // The host cannot send data; the only communication it can do with the micro is pull
     // the CLK (reset) and DATA (shift register full) low.
     // Wait for the host to release the lines.
 
-    while rtfm::atomic(|cs| {
+    while rtfm::atomic(t, |cs| {
         let pins = r.KEYBOARD_PINS.borrow(cs);
         let port = r.PORT_1_2.borrow(cs);
         pins.xt_clk.is_unset(port) || pins.xt_data.is_unset(port)
     }) { }
 
-    rtfm::atomic(|cs| {
+    rtfm::atomic(t, |cs| {
         r.KEYBOARD_PINS.borrow(cs).xt_out(r.PORT_1_2.borrow(cs));
     });
 
-    send_xt_bit(r, 0);
-    send_xt_bit(r, 1);
+    send_xt_bit(t, r, 0);
+    send_xt_bit(t, r, 1);
 
     for _ in 0..8 {
-        send_xt_bit(r, (byte & 0x01)); /* Send data... */
+        send_xt_bit(t, r, (byte & 0x01)); /* Send data... */
 		byte = byte >> 1;
     }
 
-    rtfm::atomic(|cs| {
+    rtfm::atomic(t, |cs| {
         r.KEYBOARD_PINS.borrow(cs).xt_in(r.PORT_1_2.borrow(cs));
     });
 }
 
-fn send_byte_to_at_keyboard(r: &mut idle::Resources, byte : u8) -> () {
-    rtfm::atomic(|cs| {
+fn send_byte_to_at_keyboard(t: &mut Threshold, r: &mut idle::Resources, byte : u8) -> () {
+    rtfm::atomic(t, |cs| {
         let mut key_out = r.KEY_OUT.borrow_mut(cs);
         key_out.put(byte).unwrap();
         // Safe outside of critical section: As long as HOST_MODE is
@@ -301,27 +300,27 @@ fn send_byte_to_at_keyboard(r: &mut idle::Resources, byte : u8) -> () {
 
     /* If/when timer int is enabled, this loop really needs to allow preemption during
     I/O read. Can it be done without overhead of CriticalSection? */
-    while rtfm::atomic(|cs| {
+    while rtfm::atomic(t, |cs| {
         r.KEYBOARD_PINS.borrow(cs)
             .at_clk.is_unset(r.PORT_1_2.borrow(cs))
     }) { }
 
 
-    rtfm::atomic(|cs| {
+    rtfm::atomic(t, |cs| {
         r.KEYBOARD_PINS.borrow(cs)
             .at_inhibit(r.PORT_1_2.borrow(cs));
     });
 
-    delay(r, us_to_ticks!(100));
+    delay(t, r, us_to_ticks!(100));
 
-    rtfm::atomic(|cs| {
+    rtfm::atomic(t, |cs| {
         r.KEYBOARD_PINS.borrow(cs)
             .at_data.unset(r.PORT_1_2.borrow(cs));
     });
 
-    delay(r, us_to_ticks!(33));
+    delay(t, r, us_to_ticks!(33));
 
-    rtfm::atomic(|cs| {
+    rtfm::atomic(t, |cs| {
         let pins = r.KEYBOARD_PINS.borrow(cs);
         let port = r.PORT_1_2.borrow(cs);
         pins.at_clk.set(port);
@@ -340,14 +339,15 @@ fn send_byte_to_at_keyboard(r: &mut idle::Resources, byte : u8) -> () {
     HOST_MODE.store(false);
 }
 
-fn toggle_leds(r: &mut idle::Resources, mask : u8) -> () {
-    send_byte_to_at_keyboard(r, 0xED);
-    delay(r, us_to_ticks!(3000));
-    send_byte_to_at_keyboard(r, mask);
+fn toggle_leds(t: &mut Threshold, r: &mut idle::Resources, mask : u8) -> () {
+    send_byte_to_at_keyboard(t, r, 0xED);
+    delay(t, r, us_to_ticks!(3000));
+    send_byte_to_at_keyboard(t, r, mask);
 }
 
 #[cfg(not(feature = "use-timer"))]
-fn delay(r: &mut idle::Resources, n : u16) {
+fn delay(t: &mut Threshold, r: &mut idle::Resources, n : u16) {
+    let _ = t;
     let _ = r;
     unsafe {
         asm!(r#"
@@ -359,16 +359,16 @@ fn delay(r: &mut idle::Resources, n : u16) {
 }
 
 #[cfg(feature = "use-timer")]
-fn delay(r: &mut idle::Resources, time : u16) {
-    start_timer(r, time);
+fn delay(t: &mut Threshold, r: &mut idle::Resources, time : u16) {
+    start_timer(t, r, time);
     while !TIMEOUT.load() {
 
     }
 }
 
 #[cfg(feature = "use-timer")]
-fn start_timer(r: &mut idle::Resources, time : u16) -> () {
-    rtfm::atomic(|cs| {
+fn start_timer(t: &mut Threshold, r: &mut idle::Resources, time : u16) -> () {
+    rtfm::atomic(t, |cs| {
         let timer = r.TIMER_A2.borrow(cs);
         TIMEOUT.store(false);
         timer.taccr0.write(|w| unsafe { w.bits(time) });
